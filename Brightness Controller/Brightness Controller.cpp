@@ -5,6 +5,7 @@
 #include <iostream>
 #include <ostream>
 #include <boost\asio.hpp>
+#include <thread>
 #include "ScreenBrightController.h"
 #include "TCPClient.hpp"
 
@@ -22,6 +23,13 @@
 #define configHeader	'I'
 #define sampleRate		'S'
 #define brightValue		'B'
+#define initialConfig	'C'
+#define doSample		'D'
+
+#define setSampleMode	'M'
+#define onDemandSample	'O'
+#define timedSample		'T'
+#define finishMode		'F'
 
 #pragma comment(lib, "user32.lib")
 
@@ -131,26 +139,25 @@ DWORD averageBrightness(RGBTRIPLE *mImage, DWORD height, DWORD width, char* bmpT
 }
 
 using boost::asio::ip::tcp;
-using namespace std::placeholders;
 
 bool initReady = false;							// Inicializacion completa
 bool readHeader = true;							// Lectura del header (previo al envio de datos)
-std::atomic<bool> newBrightnessValue = false;	// Nuevo valor de brillo para configurar
-bool firstSample = true;						
-
-LARGE_INTEGER frequency;						// Ticks por segundo
-LARGE_INTEGER t1, t2;							// Ticks
+std::atomic<bool> newBrightnessValue = false;	// Nuevo valor de brillo para configurar									
 
 TCPClient *client;								// Cliente TCP para IPC
 ScreenBrightController *mController;			// Controlador de brillo
 int bValue = 0;									// Valor del brillo
-unsigned int sampleDelay;						// Delay entre cada muestreo
+int sampleMode = onDemandSample;				// Modo de muestreo
+unsigned int sampleDelay;						// Delay entre cada muestreo en el modo timedSample
+
+boost::thread mainThread;						// Thread principal
 
 /* Callback llamado cuando se reciben datos.
     - bytes_transfered: número de bytes recibidos
 	- receiveBuffer: buffer donde se almacenan los bytes recibidos
 */
 void readCallback(std::size_t bytes_transfered, std::vector<char> &receiveBuffer){
+	// Leo el header que me indica la cantidad de bytes del proximo paquete a recibir
 	if (readHeader){
 		if (receiveBuffer[0] == configHeader){
 			client->setTransferAtLeast(receiveBuffer[1]);		// Número de bytes a recibir
@@ -159,37 +166,52 @@ void readCallback(std::size_t bytes_transfered, std::vector<char> &receiveBuffer
 		}
 	}
 	else{
-		// Recibo el sample rate (retardo entre cada muestreo en ms). Primero el MSB y luego el LSB
-		if (receiveBuffer[0] == sampleRate){
-			int16_t data = ((unsigned char)receiveBuffer[1] << 8) | (unsigned char)receiveBuffer[2];
-			sampleDelay = data;
-			debugOUT("Delay: " << data << std::endl);
+		// Configuracion inicial
+		if (receiveBuffer[0] == initialConfig){
+			debugOUT("Initial Config");
+			// Modo
+			sampleMode = receiveBuffer[1];
+			// Delay
+			sampleDelay = ((unsigned char)receiveBuffer[2] << 8) | (unsigned char)receiveBuffer[3];
 			initReady = true;
 		}
-
+		// Recibo el sample rate (retardo entre cada muestreo en ms). Primero el MSB y luego el LSB
+		else if (receiveBuffer[0] == sampleRate){
+			sampleDelay = ((unsigned char)receiveBuffer[1] << 8) | (unsigned char)receiveBuffer[2];
+			debugOUT("Delay: " << sampleDelay << std::endl);
+		}
 		// Recibo el brillo que se debe configurar a la pantalla (0 a 100%)
 		else if (receiveBuffer[0] == brightValue){
-			if (firstSample){
-				QueryPerformanceCounter(&t1);
-				firstSample = false;
-			}
-
+			debugOUT("Set Bright Received");
 			bValue = receiveBuffer[1];
 			newBrightnessValue = true;
+
+			// Interrumpo el Thread para salir de Sleep en caso de que esté
+			mainThread.interrupt();
 			debugOUT("Bright: " << receiveBuffer[1] << std::endl);
+		}
+		// Cambio el modo de muestreo
+		else if (receiveBuffer[0] == setSampleMode){
+			debugOUT("Sample Mode: " << sampleMode);
+			sampleMode = receiveBuffer[1];
+			mainThread.interrupt();
+		}
+		// Ejecuto un muestreo
+		else if (receiveBuffer[0] == doSample){
+			debugOUT("Do Sample");
+			mainThread.interrupt();
 		}
 		client->setTransferAtLeast(headerSize);
 		readHeader = true;
 	}
 }
 
-int _tmain(int argc, _TCHAR* argv[]) {
-
+// Programa principal
+void mainFunction(std::string portNumber){
 	boost::asio::io_service ioService;			// Asio Service
 	const std::string server = "localhost";		// Localizacion del servidor (Nombre o IP)
-	const std::string port = argv[1];			// Puerto (alias o numero)
+	const std::string port = portNumber;		// Puerto (alias o numero)
 
-	QueryPerformanceFrequency(&frequency);
 	debugOUT("Connecting to " << server << " in port " << port);
 
 	client = new TCPClient(ioService, server, port);	// Establezco conexion con el servidor
@@ -210,36 +232,83 @@ int _tmain(int argc, _TCHAR* argv[]) {
 	DWORD calculatedBrightnessValue = 0;			// Brillo calculado de la captura
 	char* bmpToFree = NULL;							// Bitmap de captura de pantalla
 
-	while (true){
+	while (sampleMode != finishMode){
 
-		if (newBrightnessValue){
-			if (!firstSample){
-				QueryPerformanceCounter(&t2);
-				double elapsedTime = (t2.QuadPart - t1.QuadPart) * 1000.0 / frequency.QuadPart;
-				std::cout << "Elapsed time: " << elapsedTime << std::endl;
-				firstSample = true;
+		// Muestreo automatico cada x mili-segundos
+		while (sampleMode == timedSample){
+
+			if (newBrightnessValue){
+				newBrightnessValue = false;
+				mController->setBrightness(bValue);
+				debugOUT("Brightness configured" << std::endl);
 			}
-			newBrightnessValue = false;
-			mController->setBrightness(bValue);
-			debugOUT("Brightness configured" << std::endl);
+
+			RGBTRIPLE *image = ScreenShot("Prueba.bmp", h, w, bmpToFree);				// Captura de pantalla
+			calculatedBrightnessValue = averageBrightness(image, h, w, bmpToFree);		// Calculo el brillo promedio de la imagen
+			GlobalFree(bmpToFree);														// Libero la memoria del bitmap
+
+			debugOUT("Image Brightness: " << calculatedBrightnessValue);
+
+			// Envío el brillo de la imagen para que en base al algoritmo y configuracion reciba el brillo que debo
+			//  aplicar a la pantalla
+			std::vector<uint8_t> data;
+			data.push_back(calculatedBrightnessValue);
+
+			client->Write<uint8_t>(data);
+			debugOUT("Sleeping for " << sampleDelay << " mS");
+			try{
+				// Delay
+				boost::this_thread::sleep(boost::posix_time::milliseconds(sampleDelay));
+			}
+			catch (boost::thread_interrupted const&){
+				std::cout << "Thread Interrupted timedSample" << std::endl;
+			}
 		}
 
-		RGBTRIPLE *image = ScreenShot("Prueba.bmp", h, w, bmpToFree);				// Captura de pantalla
-		calculatedBrightnessValue = averageBrightness(image, h, w, bmpToFree);		// Calculo el brillo promedio de la imagen
-		GlobalFree(bmpToFree);														// Libero la memoria del bitmap
+		// Muestreo cada vez que se pida
+		while (sampleMode == onDemandSample){
+			try{
+				// Cantidad de sengundos en un año XD
+				boost::this_thread::sleep(boost::posix_time::seconds(31557600));
+			}
+			catch (boost::thread_interrupted const& e){
+				std::cout << "Thread Interrupted onDemandSample" << std::endl;
+			}
 
-		debugOUT("Image Brightness: " << calculatedBrightnessValue);
-		
-		// Envío el brillo de la imagen para que en base al algoritmo y configuracion reciba el brillo que debo
-		//  aplicar a la pantalla
-		std::vector<uint8_t> data;
-		data.push_back(calculatedBrightnessValue);
+			if (newBrightnessValue){
+				newBrightnessValue = false;
+				mController->setBrightness(bValue);
+				debugOUT("Brightness configured" << std::endl);
+			}
+			else{
+				RGBTRIPLE *image = ScreenShot("Prueba.bmp", h, w, bmpToFree);				// Captura de pantalla
+				calculatedBrightnessValue = averageBrightness(image, h, w, bmpToFree);		// Calculo el brillo promedio de la imagen
+				GlobalFree(bmpToFree);														// Libero la memoria del bitmap
 
-		client->Write<uint8_t>(data);
-		Sleep(sampleDelay);
+				debugOUT("Image Brightness: " << calculatedBrightnessValue);
+
+				// Envío el brillo de la imagen para que en base al algoritmo y configuracion reciba el brillo que debo
+				//  aplicar a la pantalla
+				std::vector<uint8_t> data;
+				data.push_back(calculatedBrightnessValue);
+
+				client->Write<uint8_t>(data);
+			}
+		}
+
 	}
 
 	delete client;
 	delete mController;
 }
 
+int _tmain(int argc, _TCHAR* argv[]) {
+
+	// Creo el Thread principal
+	debugOUT("Started!");
+	mainThread = boost::thread(mainFunction, argv[1]);
+
+	debugOUT("Waiting Thread");
+	mainThread.join();
+
+}
